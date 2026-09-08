@@ -1208,23 +1208,90 @@ def send_email_with_attachment(server, port, sender, password, recipients, subje
             smtp.send_message(msg)
 
 
+def _normalize_email_addresses(value):
+    """Retourne une liste d'adresses SMTP simples et valides.
+
+    Accepte les séparateurs virgule, point-virgule et retour ligne, ainsi que
+    les formats "Nom <adresse@domaine.fr>". Les en-têtes restent lisibles,
+    mais l'enveloppe SMTP n'utilise que les adresses réelles.
+    """
+    from email.utils import getaddresses, parseaddr
+    import re
+
+    if value is None:
+        return []
+    raw = str(value).replace(";", ",").replace("\r", "\n")
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    parsed = getaddresses(parts)
+    out = []
+    for _name, addr in parsed:
+        addr = (addr or "").strip().replace("mailto:", "")
+        # garde-fou volontairement simple : Gmail validera ensuite le domaine.
+        if re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", addr):
+            if addr not in out:
+                out.append(addr)
+    # getaddresses peut ignorer une adresse simple atypiquement séparée ; second passage
+    if not out:
+        for token in parts:
+            addr = parseaddr(token)[1].strip()
+            if re.fullmatch(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+", addr):
+                out.append(addr)
+    return out
+
+
 def send_email_with_inline_qr(server, port, sender, password, recipients, subject, body, qr_bytes, use_ssl=True, auth_required=True, use_starttls=True):
-    """Envoie un mail texte + HTML avec le QR code visible dans le corps du message."""
-    msg=EmailMessage(); msg["From"],msg["To"],msg["Subject"]=sender,recipients,subject
-    msg.set_content(body)
-    html_body="<div style='font-family:Arial,sans-serif;white-space:pre-line'>"+html.escape(body).replace("\n","<br>")+"<br><br><b>QR code de validation de fin de prestation :</b><br><img src='cid:oph65qr' width='220' alt='QR code BC'></div>"
-    msg.add_alternative(html_body, subtype="html")
-    msg.get_payload()[-1].add_related(qr_bytes, maintype="image", subtype="png", cid="<oph65qr>", filename="QR_BC.png")
+    """Envoie le BC en multipart/alternative avec QR visible et joint.
+
+    Les adresses sont normalisées avant l'appel SMTP afin d'éviter les commandes
+    RCPT TO invalides (notamment listes séparées par ';'), que Gmail refuse en 5.5.2.
+    """
+    sender_list = _normalize_email_addresses(sender)
+    recipient_list = _normalize_email_addresses(recipients)
+    if len(sender_list) != 1:
+        raise ValueError("Adresse expéditeur SMTP invalide.")
+    if not recipient_list:
+        raise ValueError("Aucune adresse destinataire valide. Utilisez une adresse mail par entreprise ; plusieurs adresses peuvent être séparées par une virgule ou un point-virgule.")
+
+    sender_addr = sender_list[0]
+    msg = EmailMessage()
+    msg["From"] = sender_addr
+    msg["To"] = ", ".join(recipient_list)
+    msg["Subject"] = str(subject or "").replace("\r", " ").replace("\n", " ").strip()
+    plain_body = str(body or "")
+    msg.set_content(plain_body, charset="utf-8")
+
+    safe_html = html.escape(plain_body).replace("\n", "<br>")
+    html_body = (
+        "<html><body><div style='font-family:Arial,sans-serif;font-size:14px'>"
+        + safe_html
+        + "<br><br><b>QR code de validation de fin de prestation :</b><br>"
+          "<img src='cid:oph65qr' width='220' height='220' alt='QR code BC'>"
+          "<br><small>Si le QR code ne s'affiche pas, utilisez la pièce jointe QR_BC.png.</small>"
+          "</div></body></html>"
+    )
+    msg.add_alternative(html_body, subtype="html", charset="utf-8")
+    html_part = msg.get_payload()[-1]
+    html_part.add_related(
+        bytes(qr_bytes), maintype="image", subtype="png",
+        cid="oph65qr", disposition="inline", filename="QR_BC.png"
+    )
+    # Ajoute aussi le QR en pièce jointe pour les clients mail qui bloquent les images inline.
+    msg.add_attachment(bytes(qr_bytes), maintype="image", subtype="png", filename="QR_BC.png")
+
     if use_ssl:
-        with smtplib.SMTP_SSL(server,int(port),context=ssl.create_default_context(),timeout=25) as smtp:
-            if auth_required:smtp.login(sender,password)
-            smtp.send_message(msg)
+        with smtplib.SMTP_SSL(server, int(port), context=ssl.create_default_context(), timeout=25) as smtp:
+            if auth_required:
+                smtp.login(sender_addr, password)
+            smtp.send_message(msg, from_addr=sender_addr, to_addrs=recipient_list)
     else:
-        with smtplib.SMTP(server,int(port),timeout=25) as smtp:
+        with smtplib.SMTP(server, int(port), timeout=25) as smtp:
             smtp.ehlo()
-            if use_starttls: smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
-            if auth_required:smtp.login(sender,password)
-            smtp.send_message(msg)
+            if use_starttls:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+            if auth_required:
+                smtp.login(sender_addr, password)
+            smtp.send_message(msg, from_addr=sender_addr, to_addrs=recipient_list)
 
 
 def generate_qr_png(url):
@@ -1664,7 +1731,7 @@ def render_bc_mail_draft():
     if not d:return
     st.markdown("### ✉️ Mail du bon de commande")
     st.caption(f"Lot {d.get('lot')} — {WORK_DISPLAY_NAMES.get(d.get('work'),d.get('work'))} — BC {d.get('bc')}")
-    recipient=st.text_input("Destinataire",value=d.get("recipient",""),key="bc_recipient")
+    recipient=st.text_input("Destinataire",value=d.get("recipient",""),key="bc_recipient", help="Adresse mail de l’entreprise. Plusieurs adresses : séparez-les par une virgule ou un point-virgule.")
     subject=st.text_input("Objet",value=d.get("subject",""),key="bc_subject")
     body=st.text_area("Message",value=d.get("body",""),height=220,key="bc_body")
     if d.get("qr"): st.image(d["qr"],caption="QR code de validation",width=180)
@@ -1680,6 +1747,10 @@ def render_bc_mail_draft():
             st.session_state.bc_mail_draft=None
             for k in ("bc_recipient","bc_subject","bc_body"):st.session_state.pop(k,None)
             st.success(f"BC {d.get('bc')} envoyé à {recipient}.")
+        except smtplib.SMTPRecipientsRefused as e:
+            st.error("Gmail a refusé le destinataire. Vérifiez l’adresse mail de l’entreprise dans Paramètres → Destinataires par lot.")
+        except smtplib.SMTPDataError as e:
+            st.error(f"Gmail a refusé le contenu du message ({getattr(e, 'smtp_code', '')}). Vérifiez les adresses puis réessayez. Détail : {e}")
         except Exception as e: st.error(f"Échec de l'envoi : {e}")
 
 
