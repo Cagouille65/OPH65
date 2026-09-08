@@ -1,0 +1,6 @@
+.streamlit/secrets.toml
+oph65_config.json
+oph65_background.*
+__pycache__/
+*.pyc
+.DS_Store

@@ -60,3 +60,11 @@ Pour une utilisation durable avec les futurs QR codes et la validation des BC pa
 - Gardez le dépôt GitHub privé si le référentiel logements contient des données internes.
 - Le mot de passe SMTP doit rester dans Streamlit Secrets.
 - Lorsque la page QR publique sera créée, elle devra utiliser un jeton sécurisé et ne jamais donner accès au tableau de bord complet.
+
+---
+
+## V2.14 — Base persistante Supabase
+
+Cette version nécessite désormais l'initialisation Supabase décrite dans `README_SUPABASE.md` et `SUPABASE_SETUP.sql`.
+Après configuration, vous n'aurez plus à réimporter le fichier Excel après chaque redémarrage de Streamlit.
+Le classeur XLSM reste synchronisé et téléchargeable depuis l'onglet Import / Export.

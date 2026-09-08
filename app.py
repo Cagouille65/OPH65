@@ -12,6 +12,8 @@ import time
 import zipfile
 import tempfile
 import shutil
+import gzip
+import secrets
 from copy import copy
 from datetime import date, datetime
 
@@ -21,6 +23,20 @@ import plotly.express as px
 import streamlit.components.v1 as components
 from email.message import EmailMessage
 from openpyxl import load_workbook
+
+try:
+    import qrcode
+    HAS_QRCODE = True
+except Exception:
+    qrcode = None
+    HAS_QRCODE = False
+
+try:
+    from supabase import create_client
+    HAS_SUPABASE = True
+except Exception:
+    create_client = None
+    HAS_SUPABASE = False
 
 try:
     from reportlab.lib import colors
@@ -65,6 +81,157 @@ def _secret(path, default=None):
         return default
 
 CLOUD_MODE = bool(_secret("app.cloud_mode", False)) or bool(os.environ.get("STREAMLIT_SHARING_MODE"))
+
+
+@st.cache_resource
+def get_supabase_client():
+    """Client Supabase côté serveur. La clé n'est jamais exposée au navigateur."""
+    if not HAS_SUPABASE:
+        return None
+    url = _secret("supabase.url", "")
+    key = _secret("supabase.secret_key", "") or _secret("supabase.service_role_key", "") or _secret("supabase.key", "")
+    if not url or not key:
+        return None
+    try:
+        return create_client(str(url), str(key))
+    except Exception:
+        return None
+
+
+def supabase_ready():
+    return get_supabase_client() is not None
+
+
+def _db_json_value(v):
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(v).isoformat()
+    if hasattr(v, "item"):
+        try: return v.item()
+        except Exception: pass
+    return v
+
+
+def _serialize_row(row):
+    return {str(k): _db_json_value(v) for k, v in dict(row).items()}
+
+
+def db_save_settings(cfg):
+    client = get_supabase_client()
+    if not client: return
+    try:
+        client.table("app_settings").upsert({"key":"config", "value":cfg, "updated_at":datetime.utcnow().isoformat()}).execute()
+    except Exception:
+        pass
+
+
+def db_load_settings():
+    client = get_supabase_client()
+    if not client: return {}
+    try:
+        res = client.table("app_settings").select("value").eq("key","config").limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        return rows[0].get("value", {}) if rows else {}
+    except Exception:
+        return {}
+
+
+def db_upsert_tracking(df):
+    client = get_supabase_client()
+    if not client or df is None or df.empty or "N° LOT" not in df.columns: return
+    records=[]
+    now=datetime.utcnow().isoformat()
+    for _, row in df.iterrows():
+        lot=normalize_lot_key(row.get("N° LOT"))
+        if lot:
+            records.append({"lot_no":lot,"data":_serialize_row(row),"updated_at":now})
+    for i in range(0,len(records),400):
+        client.table("suivi_logements").upsert(records[i:i+400]).execute()
+
+
+def db_load_tracking():
+    client=get_supabase_client()
+    if not client: return pd.DataFrame()
+    all_rows=[]
+    start=0
+    try:
+        while True:
+            res=client.table("suivi_logements").select("data").range(start,start+999).execute()
+            rows=getattr(res,"data",None) or []
+            all_rows.extend([r.get("data",{}) for r in rows if isinstance(r.get("data"),dict)])
+            if len(rows)<1000: break
+            start+=1000
+    except Exception:
+        return pd.DataFrame()
+    if not all_rows: return pd.DataFrame()
+    out=pd.DataFrame(all_rows)
+    for c in out.columns:
+        if _looks_like_date_column(c): out[c]=pd.to_datetime(out[c],errors="coerce")
+    return calculate_planned_dates(apply_reference_database(out))
+
+
+def db_save_reference_database(database):
+    client=get_supabase_client()
+    if not client: return
+    now=datetime.utcnow().isoformat(); records=[]
+    for lot,row in (database or {}).items():
+        key=normalize_lot_key(lot)
+        if key: records.append({"lot_no":key,"data":_reference_row(row,key),"updated_at":now})
+    for i in range(0,len(records),400):
+        client.table("logements").upsert(records[i:i+400]).execute()
+
+
+def db_load_reference_database():
+    client=get_supabase_client()
+    if not client: return {}
+    data={}; start=0
+    try:
+        while True:
+            res=client.table("logements").select("lot_no,data").range(start,start+999).execute()
+            rows=getattr(res,"data",None) or []
+            for r in rows:
+                key=normalize_lot_key(r.get("lot_no")); row=r.get("data") or {}
+                if key: data[key]=_reference_row(row,key)
+            if len(rows)<1000: break
+            start+=1000
+    except Exception:
+        return {}
+    return data
+
+
+def db_save_excel_bytes(content, filename):
+    client=get_supabase_client()
+    if not client or not content: return
+    packed=base64.b64encode(gzip.compress(content, compresslevel=6)).decode("ascii")
+    client.table("app_files").upsert({"key":"source_workbook","filename":filename or "Suivi_Travaux_OPH65.xlsm","content_b64":packed,"updated_at":datetime.utcnow().isoformat()}).execute()
+
+
+def db_load_excel_bytes():
+    client=get_supabase_client()
+    if not client: return None, ""
+    try:
+        res=client.table("app_files").select("filename,content_b64").eq("key","source_workbook").limit(1).execute()
+        rows=getattr(res,"data",None) or []
+        if not rows: return None,""
+        raw=gzip.decompress(base64.b64decode(rows[0]["content_b64"]))
+        return raw, rows[0].get("filename") or "Suivi_Travaux_OPH65.xlsm"
+    except Exception:
+        return None,""
+
+
+def db_log_mail(kind, recipient, subject, lot_no="", bc_no="", work=""):
+    client=get_supabase_client()
+    if not client:return
+    try:
+        client.table("mail_history").insert({"kind":kind,"recipient":recipient,"subject":subject,"lot_no":str(lot_no or ""),"bc_no":str(bc_no or ""),"work_category":str(work or ""),"sent_at":datetime.utcnow().isoformat()}).execute()
+    except Exception:
+        pass
 
 
 def _shutdown_application(delay=2.0):
@@ -215,6 +382,14 @@ def load_config():
     except Exception:
         pass
 
+    # Sur le Cloud, les réglages persistants Supabase complètent le fichier local.
+    if CLOUD_MODE and supabase_ready():
+        try:
+            saved_cloud = db_load_settings()
+            if isinstance(saved_cloud, dict): defaults.update(saved_cloud)
+        except Exception:
+            pass
+
     # Les secrets Streamlit ont priorité sur les réglages locaux pour les paramètres sensibles.
     secret_map = {
         "smtp_server": "smtp.server",
@@ -242,6 +417,8 @@ def save_config(**updates):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+    if CLOUD_MODE and supabase_ready():
+        db_save_settings(cfg)
 
 
 def normalize_lot_key(value):
@@ -282,7 +459,11 @@ def _reference_row(row, key):
 
 
 def load_reference_database():
-    """Charge la base logements locale, indexée par N° LOT."""
+    """Charge le référentiel maître. Supabase est prioritaire en mode Cloud."""
+    if CLOUD_MODE and supabase_ready():
+        cloud = db_load_reference_database()
+        if cloud:
+            return cloud
     try:
         if os.path.exists(REFERENCE_DB_PATH):
             with open(REFERENCE_DB_PATH, "r", encoding="utf-8") as f:
@@ -293,6 +474,10 @@ def load_reference_database():
                     key = normalize_lot_key(lot)
                     if key and isinstance(row, dict):
                         cleaned[key] = _reference_row(row, key)
+                # Initialise automatiquement Supabase au premier démarrage.
+                if CLOUD_MODE and supabase_ready() and cleaned:
+                    try: db_save_reference_database(cleaned)
+                    except Exception: pass
                 return cleaned
     except Exception:
         pass
@@ -310,6 +495,8 @@ def save_reference_database(database):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
     os.replace(tmp, REFERENCE_DB_PATH)
+    if CLOUD_MODE and supabase_ready():
+        db_save_reference_database(payload)
 
 
 def lookup_lot_reference(lot_no):
@@ -757,6 +944,49 @@ def save_to_source_xlsm(df, path):
             except Exception: pass
 
 
+def update_workbook_bytes(df, original_bytes, filename):
+    """Met à jour une copie du classeur XLSX/XLSM et renvoie ses octets (VBA préservé pour XLSM)."""
+    if not original_bytes:
+        raise FileNotFoundError("Aucun classeur source n'est enregistré. Importez d'abord le fichier Excel/XLSM.")
+    suffix=os.path.splitext(filename or "")[1].lower()
+    if suffix not in (".xlsx",".xlsm",".xltx",".xltm"): suffix=".xlsm"
+    fd,path=tempfile.mkstemp(prefix="oph65_cloud_",suffix=suffix); os.close(fd)
+    try:
+        with open(path,"wb") as f: f.write(original_bytes)
+        save_to_source_xlsm(df,path)
+        with open(path,"rb") as f: return f.read()
+    finally:
+        for candidate in (path,path+".bak"):
+            try:
+                if os.path.exists(candidate): os.remove(candidate)
+            except Exception: pass
+
+
+def persist_tracking_and_excel(df):
+    """Sauvegarde la base persistante puis synchronise le classeur Excel conservé dans Supabase."""
+    if CLOUD_MODE and supabase_ready():
+        db_upsert_tracking(df)
+        original=st.session_state.get("source_workbook_bytes")
+        filename=st.session_state.get("source_workbook_name") or st.session_state.get("filename") or "Suivi_Travaux_OPH65.xlsm"
+        if not original:
+            original, saved_name=db_load_excel_bytes()
+            if original:
+                st.session_state.source_workbook_bytes=original
+                st.session_state.source_workbook_name=saved_name
+                filename=saved_name
+        if original:
+            updated=update_workbook_bytes(df,original,filename)
+            st.session_state.source_workbook_bytes=updated
+            st.session_state.source_workbook_name=filename
+            db_save_excel_bytes(updated,filename)
+            return True
+        return False
+    if st.session_state.get("source_path") and st.session_state.get("auto_save"):
+        save_to_source_xlsm(df,st.session_state.source_path)
+        return True
+    return False
+
+
 def export_flat_excel(df):
     output = io.BytesIO()
     clean = df.drop(columns=[c for c in df.columns if c.startswith("Statut ") or c.startswith("_mailto_") or c == "Statut global"], errors="ignore")
@@ -976,6 +1206,95 @@ def send_email_with_attachment(server, port, sender, password, recipients, subje
                 smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
             if auth_required: smtp.login(sender, password)
             smtp.send_message(msg)
+
+
+def send_email_with_inline_qr(server, port, sender, password, recipients, subject, body, qr_bytes, use_ssl=True, auth_required=True, use_starttls=True):
+    """Envoie un mail texte + HTML avec le QR code visible dans le corps du message."""
+    msg=EmailMessage(); msg["From"],msg["To"],msg["Subject"]=sender,recipients,subject
+    msg.set_content(body)
+    html_body="<div style='font-family:Arial,sans-serif;white-space:pre-line'>"+html.escape(body).replace("\n","<br>")+"<br><br><b>QR code de validation de fin de prestation :</b><br><img src='cid:oph65qr' width='220' alt='QR code BC'></div>"
+    msg.add_alternative(html_body, subtype="html")
+    msg.get_payload()[-1].add_related(qr_bytes, maintype="image", subtype="png", cid="<oph65qr>", filename="QR_BC.png")
+    if use_ssl:
+        with smtplib.SMTP_SSL(server,int(port),context=ssl.create_default_context(),timeout=25) as smtp:
+            if auth_required:smtp.login(sender,password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(server,int(port),timeout=25) as smtp:
+            smtp.ehlo()
+            if use_starttls: smtp.starttls(context=ssl.create_default_context()); smtp.ehlo()
+            if auth_required:smtp.login(sender,password)
+            smtp.send_message(msg)
+
+
+def generate_qr_png(url):
+    if not HAS_QRCODE: raise RuntimeError("Le module qrcode n'est pas installé.")
+    img=qrcode.make(url); out=io.BytesIO(); img.save(out,format="PNG"); return out.getvalue()
+
+
+def create_bc_validation(lot_no, bc_no, work, company_email):
+    token=secrets.token_urlsafe(24)
+    client=get_supabase_client()
+    if not client: raise RuntimeError("Supabase n'est pas configuré.")
+    client.table("bc_validations").insert({
+        "token":token,"bc_no":str(bc_no),"lot_no":normalize_lot_key(lot_no),"work_category":work,
+        "company_email":company_email or "","status":"pending","created_at":datetime.utcnow().isoformat()
+    }).execute()
+    return token
+
+
+def load_bc_validation(token):
+    client=get_supabase_client()
+    if not client:return None
+    try:
+        res=client.table("bc_validations").select("*").eq("token",token).limit(1).execute()
+        rows=getattr(res,"data",None) or []
+        return rows[0] if rows else None
+    except Exception:return None
+
+
+def complete_bc_validation(token):
+    validation=load_bc_validation(token)
+    if not validation: raise ValueError("QR code inconnu ou expiré.")
+    if validation.get("status")=="validated": return validation
+    df=db_load_tracking()
+    lot=normalize_lot_key(validation.get("lot_no")); work=validation.get("work_category")
+    if df.empty or lot not in df["N° LOT"].map(normalize_lot_key).values: raise ValueError("Le logement correspondant n'existe plus dans le suivi.")
+    matches=df.index[df["N° LOT"].map(normalize_lot_key)==lot].tolist(); idx=matches[0]
+    real_col=WORK_COLUMNS.get(work,{}).get("real")
+    if real_col and real_col in df.columns: df.at[idx,real_col]=pd.Timestamp(date.today())
+    df=normalize_date_dtypes(calculate_planned_dates(df))
+    db_upsert_tracking(df)
+    original,name=db_load_excel_bytes()
+    if original:
+        updated=update_workbook_bytes(df,original,name); db_save_excel_bytes(updated,name)
+    client=get_supabase_client(); client.table("bc_validations").update({"status":"validated","validated_at":datetime.utcnow().isoformat()}).eq("token",token).execute()
+    validation["status"]="validated"; validation["validated_at"]=datetime.utcnow().isoformat()
+    return validation
+
+
+def render_public_bc_validation(token):
+    validation=load_bc_validation(token)
+    st.markdown("<style>[data-testid='stSidebar']{display:none}</style>",unsafe_allow_html=True)
+    if os.path.exists(LOGO_PATH): st.image(LOGO_PATH,width=180)
+    st.title("Validation de fin de prestation")
+    if not validation:
+        st.error("Ce QR code n'est pas valide."); st.stop()
+    st.markdown(f"**Bon de commande :** {html.escape(str(validation.get('bc_no','')))}  \n**N° lot :** {html.escape(str(validation.get('lot_no','')))}  \n**Prestation :** {html.escape(WORK_DISPLAY_NAMES.get(validation.get('work_category'),validation.get('work_category','')))}")
+    if validation.get("status")=="validated":
+        st.success("La fin de prestation a déjà été validée. Merci."); st.stop()
+    st.info("Après avoir terminé la prestation, validez ci-dessous. Le Responsable Technique de Secteur sera automatiquement informé.")
+    if st.button("✅ Valider la fin de prestation",type="primary",use_container_width=True):
+        try:
+            val=complete_bc_validation(token)
+            recipient=str(_secret("app.rts_email","") or load_config().get("rts_email","")).strip()
+            if recipient:
+                body=f"Bonjour,\n\nLa fin de prestation vient d'être validée par QR code.\n\nBC : {val.get('bc_no','')}\nN° lot : {val.get('lot_no','')}\nPrestation : {WORK_DISPLAY_NAMES.get(val.get('work_category'),val.get('work_category',''))}\nDate : {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\nCordialement,\nOPH65"
+                send_email_with_attachment(st.session_state.smtp_server,st.session_state.smtp_port,st.session_state.smtp_email,st.session_state.smtp_password,recipient,f"Fin de prestation – BC {val.get('bc_no','')}",body,use_ssl=st.session_state.smtp_use_ssl,auth_required=st.session_state.smtp_auth_required,use_starttls=st.session_state.smtp_use_starttls)
+                db_log_mail("validation_bc",recipient,f"Fin de prestation – BC {val.get('bc_no','')}",val.get('lot_no',''),val.get('bc_no',''),val.get('work_category',''))
+            st.success("Fin de prestation validée. Le Responsable Technique de Secteur a été informé."); st.balloons()
+        except Exception as e: st.error(f"Impossible de valider : {e}")
+    st.stop()
 
 
 def test_smtp_connection(server, port, sender, password, use_ssl=True, auth_required=True, use_starttls=True):
@@ -1309,6 +1628,86 @@ def chart_detail_table(df, work, status):
 
 
 
+def bc_management_dataframe(df):
+    e=enrich(df); rows=[]
+    for idx,r in e.iterrows():
+        for work,cols in WORK_COLUMNS.items():
+            bc=r.get(cols["order"],""); bc="" if pd.isna(bc) else str(bc).strip()
+            if not bc: continue
+            status=r.get(f"Statut {work}","Non démarré")
+            if status not in ("En cours","En retard"): continue
+            rows.append({
+                "N° LOT":r.get("N° LOT",""),"RSD":r.get("RSD",""),"Bât":r.get("Bât",""),"Ent":r.get("Ent",""),"Porte":r.get("Porte",""),
+                "Corps d'état":work,"N° BC":bc,"Date BC":r.get(cols["start"],pd.NaT),"Date théorique":r.get(cols["planned"],pd.NaT),
+                "Statut":status,"Entreprise / mail":st.session_state.lot_emails.get(work,""),"_row_index":str(idx)
+            })
+    out=pd.DataFrame(rows)
+    if not out.empty: out=out.sort_values(["N° LOT","Statut","Corps d'état"],kind="stable")
+    return out
+
+
+def prepare_bc_mail(record):
+    bc=str(record.get("N° BC","")).strip(); lot=normalize_lot_key(record.get("N° LOT")); work=record.get("Corps d'état","")
+    recipient=st.session_state.lot_emails.get(work,"") or str(record.get("Entreprise / mail","") or "")
+    token=create_bc_validation(lot,bc,work,recipient)
+    base=str(_secret("app.public_base_url","") or "").rstrip("/")
+    if not base: raise RuntimeError("Renseignez app.public_base_url dans les Secrets Streamlit.")
+    url=f"{base}/?bc_token={urllib.parse.quote(token)}"
+    qr=generate_qr_png(url)
+    body=("Ce bon de commande est à réaliser, en cours de réalisation ou en retard. Merci de faire le nécessaire pour la réalisation des travaux dans le temps imparti conformément au CCTP.\n\n"
+          "A l'issue, merci de scanner le QR code joint et valider l'envoi du mail pour informer le Responsable Technique de Secteur de la fin de votre prestation.")
+    st.session_state.bc_mail_draft={"recipient":recipient,"subject":f"BC {bc}","body":body,"qr":qr,"url":url,"bc":bc,"lot":lot,"work":work}
+
+
+def render_bc_mail_draft():
+    d=st.session_state.get("bc_mail_draft")
+    if not d:return
+    st.markdown("### ✉️ Mail du bon de commande")
+    st.caption(f"Lot {d.get('lot')} — {WORK_DISPLAY_NAMES.get(d.get('work'),d.get('work'))} — BC {d.get('bc')}")
+    recipient=st.text_input("Destinataire",value=d.get("recipient",""),key="bc_recipient")
+    subject=st.text_input("Objet",value=d.get("subject",""),key="bc_subject")
+    body=st.text_area("Message",value=d.get("body",""),height=220,key="bc_body")
+    if d.get("qr"): st.image(d["qr"],caption="QR code de validation",width=180)
+    c1,c2=st.columns(2)
+    if c1.button("✖ Fermer",use_container_width=True,key="bc_close"):
+        st.session_state.bc_mail_draft=None
+        for k in ("bc_recipient","bc_subject","bc_body"):st.session_state.pop(k,None)
+        st.rerun()
+    if c2.button("📤 Envoyer le BC",type="primary",use_container_width=True,key="bc_send"):
+        try:
+            send_email_with_inline_qr(st.session_state.smtp_server,st.session_state.smtp_port,st.session_state.smtp_email,st.session_state.smtp_password,recipient,subject,body,d["qr"],use_ssl=st.session_state.smtp_use_ssl,auth_required=st.session_state.smtp_auth_required,use_starttls=st.session_state.smtp_use_starttls)
+            db_log_mail("bc",recipient,subject,d.get("lot"),d.get("bc"),d.get("work"))
+            st.session_state.bc_mail_draft=None
+            for k in ("bc_recipient","bc_subject","bc_body"):st.session_state.pop(k,None)
+            st.success(f"BC {d.get('bc')} envoyé à {recipient}.")
+        except Exception as e: st.error(f"Échec de l'envoi : {e}")
+
+
+def render_bc_management():
+    st.title("📦 Gestion des BC")
+    if st.session_state.df.empty:
+        st.warning("Aucune donnée de suivi disponible."); return
+    bcdf=bc_management_dataframe(st.session_state.df)
+    if bcdf.empty:
+        st.success("Aucun bon de commande en cours ou en retard."); return
+    a,b,c=st.columns(3); a.metric("BC actifs",len(bcdf)); b.metric("En retard",int((bcdf["Statut"]=="En retard").sum())); c.metric("En cours",int((bcdf["Statut"]=="En cours").sum()))
+    status_filter=st.multiselect("Statut",["En retard","En cours"],default=["En retard","En cours"]); view=bcdf[bcdf["Statut"].isin(status_filter)].copy()
+    display=view.drop(columns=["_row_index"],errors="ignore")
+    show_excel_grid(display,height=450,key="bc_management_grid")
+    choices=[]; mapping={}
+    for i,r in view.reset_index(drop=True).iterrows():
+        work_name = WORK_DISPLAY_NAMES.get(r["Corps d'état"], r["Corps d'état"])
+        label=f"Lot {r['N° LOT']} — BC {r['N° BC']} — {work_name} — {r['Statut']}"
+        choices.append(label); mapping[label]=r.to_dict()
+    selected=st.selectbox("BC à envoyer / renvoyer",choices,key="bc_choice")
+    if st.button("✉️ Préparer le mail et le QR code",type="primary",use_container_width=True):
+        try:
+            for k in ("bc_recipient","bc_subject","bc_body"):st.session_state.pop(k,None)
+            prepare_bc_mail(mapping[selected]); st.rerun()
+        except Exception as e: st.error(str(e))
+    render_bc_mail_draft()
+
+
 def _identity_value(value, default="Non renseigné"):
     text = _clean(value)
     return text if text else default
@@ -1437,10 +1836,25 @@ ss_default("edit_form_version", 0)
 ss_default("edit_form_reset_pending", False)
 ss_default("save_dialog_pending", False)
 ss_default("save_dialog_message", "Le logement a été enregistré avec succès.")
+ss_default("source_workbook_bytes", None)
+ss_default("source_workbook_name", "")
+ss_default("bc_mail_draft", None)
+ss_default("rts_email", cfg.get("rts_email", str(_secret("app.rts_email", "") or "")))
 
 if "autoload_done" not in st.session_state:
     st.session_state.autoload_done = True
-    if st.session_state.source_path and os.path.exists(st.session_state.source_path):
+    if CLOUD_MODE and supabase_ready():
+        try:
+            cloud_df=db_load_tracking()
+            if not cloud_df.empty:
+                st.session_state.df=cloud_df
+                wb_bytes,wb_name=db_load_excel_bytes()
+                st.session_state.source_workbook_bytes=wb_bytes
+                st.session_state.source_workbook_name=wb_name
+                st.session_state.filename=wb_name or "Base Supabase"
+        except Exception:
+            pass
+    elif st.session_state.source_path and os.path.exists(st.session_state.source_path):
         try:
             st.session_state.df = read_excel(st.session_state.source_path)
             st.session_state.filename = os.path.basename(st.session_state.source_path)
@@ -1467,6 +1881,27 @@ h1,h2,h3 {{ color:{st.session_state.primary_color}; font-family:{st.session_stat
 </style>
 """, unsafe_allow_html=True)
 
+# Les liens QR ouvrent une page publique minimale, sans accès au reste de l'application.
+try:
+    _bc_token = st.query_params.get("bc_token", "")
+except Exception:
+    _bc_token = ""
+if _bc_token:
+    render_public_bc_validation(str(_bc_token))
+
+# Protection simple de l'interface interne sur une URL Streamlit publique.
+_access_password = str(_secret("app.access_password", "") or "")
+if CLOUD_MODE and _access_password and not st.session_state.get("oph65_authenticated", False):
+    if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, width=190)
+    st.title("OPH65 — Accès sécurisé")
+    entered=st.text_input("Mot de passe d'accès",type="password",key="cloud_access_password")
+    if st.button("Se connecter",type="primary",use_container_width=True):
+        if secrets.compare_digest(entered,_access_password):
+            st.session_state.oph65_authenticated=True; st.rerun()
+        else:
+            st.error("Mot de passe incorrect.")
+    st.stop()
+
 with st.sidebar:
     if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, use_container_width=True)
     st.markdown("### 🏗️ Suivi des travaux")
@@ -1477,7 +1912,7 @@ with st.sidebar:
         st.rerun()
     page = st.radio("Navigation", [
         "🏠 Tableau de bord", "📋 Suivi des logements", "🔎 Consultation des données",
-        "➕ Ajouter / Modifier", "📊 Analyses", "📁 Import / Export", "⚙️ Paramètres"
+        "➕ Ajouter / Modifier", "📦 Gestion des BC", "📊 Analyses", "📁 Import / Export", "⚙️ Paramètres"
     ], key="navigation_page")
     st.divider()
     if not CLOUD_MODE:
@@ -1485,7 +1920,7 @@ with st.sidebar:
             confirm_application_exit()
     else:
         st.caption("☁️ Mode Streamlit Cloud")
-    st.caption("V2.13 Cloud — fiches logements & personnalisation typographique")
+    st.caption("V2.14 Cloud — Supabase, Excel synchronisé & Gestion des BC")
 
 if st.session_state.get("identity_lot"):
     render_housing_identity(st.session_state.identity_lot)
@@ -1517,14 +1952,28 @@ elif page == "📁 Import / Export":
                 st.caption(f"📌 Fichier mémorisé : {st.session_state.source_path}")
         with tab_upload:
             uploaded = st.file_uploader("Importer un fichier Excel", type=["xlsx", "xlsm", "xls"])
-        if uploaded is not None:
-            try:
-                st.session_state.df = read_excel(uploaded)
-                st.session_state.filename = uploaded.name
-                st.session_state.source_path = ""
-                st.success(f"Fichier chargé : {uploaded.name} — {len(st.session_state.df)} logement(s).")
-            except Exception as e: st.error(f"Impossible de lire le fichier : {e}")
+    if uploaded is not None:
+        try:
+            uploaded_bytes=uploaded.getvalue()
+            st.session_state.df = read_excel(io.BytesIO(uploaded_bytes))
+            st.session_state.filename = uploaded.name
+            st.session_state.source_path = ""
+            st.session_state.source_workbook_bytes=uploaded_bytes
+            st.session_state.source_workbook_name=uploaded.name
+            if CLOUD_MODE and supabase_ready():
+                db_upsert_tracking(st.session_state.df)
+                db_save_excel_bytes(uploaded_bytes,uploaded.name)
+            st.success(f"Fichier chargé et synchronisé : {uploaded.name} — {len(st.session_state.df)} logement(s).")
+        except Exception as e: st.error(f"Impossible de lire le fichier : {e}")
     if not st.session_state.df.empty:
+        if CLOUD_MODE and supabase_ready():
+            latest_bytes=st.session_state.get("source_workbook_bytes")
+            latest_name=st.session_state.get("source_workbook_name") or "Suivi_Travaux_OPH65.xlsm"
+            if not latest_bytes:
+                latest_bytes,latest_name=db_load_excel_bytes()
+            if latest_bytes:
+                mime="application/vnd.ms-excel.sheet.macroEnabled.12" if latest_name.lower().endswith(".xlsm") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.download_button("⬇️ Télécharger le classeur Excel synchronisé",latest_bytes,latest_name,mime,use_container_width=True)
         st.download_button("⬇️ Télécharger une copie Excel aplatie", export_flat_excel(st.session_state.df), "OPH65_suivi_travaux.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif page == "🏠 Tableau de bord":
@@ -1680,24 +2129,29 @@ elif page == "➕ Ajouter / Modifier":
                     save_config(residences=st.session_state.residence_options)
 
                 save_ok = True
-                if st.session_state.source_path and st.session_state.auto_save:
-                    try:
-                        save_to_source_xlsm(st.session_state.df, st.session_state.source_path)
-                    except Exception as e:
-                        save_ok = False
-                        st.warning(f"Logement enregistré dans l'application, mais mise à jour du classeur impossible : {e}")
+                try:
+                    if CLOUD_MODE and supabase_ready():
+                        save_ok = persist_tracking_and_excel(st.session_state.df)
+                    elif st.session_state.source_path and st.session_state.auto_save:
+                        save_ok = persist_tracking_and_excel(st.session_state.df)
+                except Exception as e:
+                    save_ok = False
+                    st.warning(f"Logement enregistré dans l'application, mais synchronisation persistante / Excel impossible : {e}")
 
                 # Le formulaire est toujours remis à zéro après validation dans l'application.
                 # Une erreur du classeur ne doit pas bloquer la saisie suivante.
                 st.session_state.edit_form_reset_pending = True
                 st.session_state.save_dialog_pending = True
                 if save_ok:
-                    st.session_state.save_dialog_message = "Enregistrement effectué. Le logement a été enregistré dans l'application et dans le classeur Excel."
+                    st.session_state.save_dialog_message = "Enregistrement effectué. Les données persistantes et le classeur Excel synchronisé ont été mis à jour."
                 elif st.session_state.source_path and st.session_state.auto_save:
                     st.session_state.save_dialog_message = "Enregistrement effectué dans l'application. Attention : le classeur Excel n'a pas pu être mis à jour ; rechargez le fichier original depuis Import / Export."
                 else:
                     st.session_state.save_dialog_message = "Enregistrement effectué dans l'application."
                 st.rerun()
+
+elif page == "📦 Gestion des BC":
+    render_bc_management()
 
 elif page == "📊 Analyses":
     st.title("📊 Analyses")
@@ -1765,7 +2219,7 @@ elif page == "📊 Analyses":
 
 elif page == "⚙️ Paramètres":
     st.title("⚙️ Paramètres")
-    t1,t2,t3,t4,t5,t6 = st.tabs(["🎨 Apparence & fond","🏠 Base logements","🏢 Résidences","📧 Destinataires par lot","👤 Utilisateurs / dates","✉️ Emails / SMTP"])
+    t1,t2,t3,t4,t5,t6,t7 = st.tabs(["🎨 Apparence & fond","🏠 Base logements","🏢 Résidences","📧 Destinataires par lot","👤 Utilisateurs / dates","✉️ Emails / SMTP","☁️ Base persistante"])
 
     with t1:
         st.markdown("### Apparence générale")
@@ -1989,6 +2443,7 @@ elif page == "⚙️ Paramètres":
             help=("Sur Streamlit Cloud, configurez ce mot de passe dans Settings → Secrets. En local, il peut être mémorisé dans le coffre du système." if CLOUD_MODE else "Le mot de passe est mémorisé de manière sécurisée par le système, et non dans oph65_config.json."),
         )
         rec = b.text_input("Destinataire(s) par défaut", value=st.session_state.email_recipients)
+        rts_email = b.text_input("Adresse mail Responsable Technique de Secteur", value=st.session_state.rts_email, help="Cette adresse reçoit automatiquement la validation de fin de prestation après scan du QR code.")
 
         st.markdown("#### Modèle du mail de synthèse")
         subject_template = st.text_input(
@@ -2013,6 +2468,7 @@ elif page == "⚙️ Paramètres":
             st.session_state.smtp_port = int(port)
             st.session_state.smtp_password = password
             st.session_state.email_recipients = rec
+            st.session_state.rts_email = rts_email.strip()
             st.session_state.analysis_email_subject_template = subject_template
             st.session_state.analysis_email_body = body_template
             st.session_state.delay_email_subject_template = delay_subject_template
@@ -2025,6 +2481,7 @@ elif page == "⚙️ Paramètres":
                 smtp_use_starttls=use_starttls,
                 smtp_port=int(port),
                 email_recipients=rec,
+                rts_email=rts_email.strip(),
                 analysis_email_subject_template=subject_template,
                 analysis_email_body=body_template,
                 delay_email_subject_template=delay_subject_template,
@@ -2053,3 +2510,33 @@ elif page == "⚙️ Paramètres":
                 except Exception as e:
                     st.error(f"Impossible de se connecter au serveur SMTP : {e}")
 
+
+
+    with t7:
+        st.markdown("### ☁️ Base de données persistante")
+        if supabase_ready():
+            st.success("Supabase est configuré et accessible depuis l'application.")
+            try:
+                cloud_df=db_load_tracking()
+                ref_count=len(db_load_reference_database())
+                wb_bytes,wb_name=db_load_excel_bytes()
+                c1,c2,c3=st.columns(3)
+                c1.metric("Logements suivis",len(cloud_df))
+                c2.metric("Fiches logements",ref_count)
+                c3.metric("Classeur Excel", "Disponible" if wb_bytes else "Non chargé")
+                if wb_name: st.caption(f"Classeur synchronisé : {wb_name}")
+            except Exception as e:
+                st.warning(f"Connexion présente mais lecture impossible : {e}")
+            if st.button("🔄 Recharger les données depuis Supabase",use_container_width=True):
+                cloud_df=db_load_tracking()
+                if not cloud_df.empty:
+                    st.session_state.df=cloud_df
+                    wb_bytes,wb_name=db_load_excel_bytes()
+                    st.session_state.source_workbook_bytes=wb_bytes
+                    st.session_state.source_workbook_name=wb_name
+                    st.success("Données rechargées depuis Supabase.")
+                    st.rerun()
+        else:
+            st.error("Supabase n'est pas encore configuré dans les Secrets Streamlit.")
+            st.code('[supabase]\nurl = "https://VOTRE-PROJET.supabase.co"\nsecret_key = "VOTRE_CLE_SECRETE_SUPABASE"', language='toml')
+            st.caption("Exécutez d'abord le fichier SUPABASE_SETUP.sql dans SQL Editor de Supabase, puis ajoutez ces deux valeurs dans Settings → Secrets de votre application Streamlit.")
