@@ -1320,23 +1320,100 @@ def load_bc_validation(token):
     except Exception:return None
 
 
+def _normalized_header_key(value):
+    """Normalise un nom de colonne pour retrouver les variantes accentuées/non accentuées."""
+    import unicodedata
+    txt=unicodedata.normalize("NFKD", str(value or ""))
+    txt="".join(ch for ch in txt if not unicodedata.combining(ch))
+    return " ".join(txt.upper().replace("\n"," ").split())
+
+
+def _resolve_tracking_column(df, expected):
+    if expected in df.columns:
+        return expected
+    target=_normalized_header_key(expected)
+    for col in df.columns:
+        if _normalized_header_key(col)==target:
+            return col
+    return None
+
+
 def complete_bc_validation(token):
+    """Valide un BC, met à jour Supabase ET le classeur Excel synchronisé.
+
+    La recherche s'effectue sur le triplet N° LOT + corps d'état + N° BC afin
+    d'éviter toute mise à jour d'une mauvaise prestation.
+    """
     validation=load_bc_validation(token)
-    if not validation: raise ValueError("QR code inconnu ou expiré.")
-    if validation.get("status")=="validated": return validation
+    if not validation:
+        raise ValueError("QR code inconnu ou expiré.")
+    if validation.get("status")=="validated":
+        return validation
+
     df=db_load_tracking()
-    lot=normalize_lot_key(validation.get("lot_no")); work=validation.get("work_category")
-    if df.empty or lot not in df["N° LOT"].map(normalize_lot_key).values: raise ValueError("Le logement correspondant n'existe plus dans le suivi.")
-    matches=df.index[df["N° LOT"].map(normalize_lot_key)==lot].tolist(); idx=matches[0]
-    real_col=WORK_COLUMNS.get(work,{}).get("real")
-    if real_col and real_col in df.columns: df.at[idx,real_col]=pd.Timestamp(date.today())
+    lot=normalize_lot_key(validation.get("lot_no"))
+    work=str(validation.get("work_category") or "")
+    bc_expected=str(validation.get("bc_no") or "").strip()
+    if df.empty or "N° LOT" not in df.columns:
+        raise ValueError("Le suivi persistant est vide ou indisponible.")
+
+    cols=WORK_COLUMNS.get(work)
+    if not cols:
+        raise ValueError(f"Corps d'état inconnu : {work}")
+    order_col=_resolve_tracking_column(df, cols.get("order"))
+    real_col=_resolve_tracking_column(df, cols.get("real"))
+    if not real_col:
+        raise ValueError(f"La colonne de date réelle n'a pas été trouvée pour {work}.")
+
+    lot_mask=df["N° LOT"].map(normalize_lot_key)==lot
+    candidate_indexes=df.index[lot_mask].tolist()
+    if not candidate_indexes:
+        raise ValueError("Le logement correspondant n'existe plus dans le suivi.")
+
+    # Si un N° BC est disponible, on exige qu'il corresponde à la prestation validée.
+    idx=None
+    for candidate in candidate_indexes:
+        current_bc=""
+        if order_col:
+            value=df.at[candidate,order_col]
+            current_bc="" if pd.isna(value) else str(value).strip()
+        if not bc_expected or current_bc==bc_expected:
+            idx=candidate
+            break
+    if idx is None:
+        raise ValueError(f"Le BC {bc_expected} ne correspond plus au logement {lot} pour {work}.")
+
+    validation_date=pd.Timestamp(date.today())
+    df.at[idx,real_col]=validation_date
     df=normalize_date_dtypes(calculate_planned_dates(df))
+
+    # 1) Base persistante Supabase.
     db_upsert_tracking(df)
+
+    # Contrôle de lecture après écriture : on ne confirme jamais la validation
+    # si la date réelle n'est pas effectivement persistée.
+    check=db_load_tracking()
+    check_rows=check.index[check["N° LOT"].map(normalize_lot_key)==lot].tolist() if not check.empty and "N° LOT" in check.columns else []
+    if not check_rows:
+        raise RuntimeError("La mise à jour Supabase n'a pas pu être vérifiée.")
+    check_real=_resolve_tracking_column(check, real_col)
+    saved_value=check.at[check_rows[0],check_real] if check_real else pd.NaT
+    if pd.isna(saved_value) or pd.Timestamp(saved_value).date()!=validation_date.date():
+        raise RuntimeError("La date de fin n'a pas été enregistrée dans Supabase.")
+
+    # 2) Copie Excel persistante.
     original,name=db_load_excel_bytes()
     if original:
-        updated=update_workbook_bytes(df,original,name); db_save_excel_bytes(updated,name)
-    client=get_supabase_client(); client.table("bc_validations").update({"status":"validated","validated_at":datetime.utcnow().isoformat()}).eq("token",token).execute()
-    validation["status"]="validated"; validation["validated_at"]=datetime.utcnow().isoformat()
+        updated=update_workbook_bytes(df,original,name)
+        db_save_excel_bytes(updated,name)
+
+    # 3) Historique de validation QR.
+    validated_at=datetime.utcnow().isoformat()
+    client=get_supabase_client()
+    client.table("bc_validations").update({"status":"validated","validated_at":validated_at}).eq("token",token).execute()
+    validation["status"]="validated"
+    validation["validated_at"]=validated_at
+    validation["real_date"]=validation_date.strftime("%Y-%m-%d")
     return validation
 
 
@@ -1939,9 +2016,17 @@ st.markdown(f"""
 {page_background_css}
 [data-testid="stSidebar"] {{ background:{st.session_state.sidebar_color}; }}
 [data-testid="stSidebar"] * {{ color:white; }}
-[data-testid="stSidebar"] [data-baseweb="select"] > div {{ background:#e5e7eb !important; border-color:#cbd5e1 !important; }}
-[data-testid="stSidebar"] [data-baseweb="select"] span,
-[data-testid="stSidebar"] [data-baseweb="select"] div {{ color:#1f2937 !important; }}
+/* Zone utilisateur : fond gris clair et texte foncé, indépendamment du thème Streamlit. */
+[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div[role="combobox"] {{
+    background:#e5e7eb !important; border:1px solid #cbd5e1 !important; color:#1f2937 !important;
+}}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] span,
+[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] div,
+[data-testid="stSidebar"] [data-testid="stSelectbox"] [data-baseweb="select"] svg {{
+    color:#1f2937 !important; fill:#1f2937 !important;
+}}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] label p {{ color:white !important; }}
 [data-testid="stAppViewContainer"] {{ color:{st.session_state.font_color}; font-family:{st.session_state.font_family}, sans-serif; }}
 [data-testid="stAppViewContainer"] p, [data-testid="stAppViewContainer"] label,
 [data-testid="stAppViewContainer"] input, [data-testid="stAppViewContainer"] textarea,
@@ -1973,6 +2058,21 @@ if CLOUD_MODE and _access_password and not st.session_state.get("oph65_authentic
             st.error("Mot de passe incorrect.")
     st.stop()
 
+# Sur le Cloud, Supabase est la source de vérité. Un QR code est validé dans une
+# autre session navigateur : on recharge donc le suivi à chaque rerun de
+# l'interface interne pour refléter immédiatement les validations externes.
+if CLOUD_MODE and supabase_ready() and (not _access_password or st.session_state.get("oph65_authenticated", False)):
+    try:
+        _fresh_tracking=db_load_tracking()
+        if not _fresh_tracking.empty:
+            st.session_state.df=_fresh_tracking
+            _wb,_wb_name=db_load_excel_bytes()
+            if _wb:
+                st.session_state.source_workbook_bytes=_wb
+                st.session_state.source_workbook_name=_wb_name
+    except Exception:
+        pass
+
 with st.sidebar:
     if os.path.exists(LOGO_PATH): st.image(LOGO_PATH, use_container_width=True)
     st.markdown("### 🏗️ Suivi des travaux")
@@ -1991,7 +2091,7 @@ with st.sidebar:
             confirm_application_exit()
     else:
         st.caption("☁️ Mode Streamlit Cloud")
-    st.caption("V2.14 Cloud — Supabase, Excel synchronisé & Gestion des BC")
+    st.caption("V2.16 Cloud — Supabase, Excel synchronisé & Gestion des BC")
 
 if st.session_state.get("identity_lot"):
     render_housing_identity(st.session_state.identity_lot)
